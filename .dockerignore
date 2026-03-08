@@ -47,6 +47,10 @@ Core/
 Users/
 vendor/
 
+# Chrome extension assets needed for `openclaw browser extension install`.
+!assets/chrome-extension/
+!assets/chrome-extension/**
+
 # Needed for building the Canvas A2UI bundle during Docker image builds.
 # Keep the rest of apps/ and vendor/ excluded to avoid a large build context.
 !apps/shared/

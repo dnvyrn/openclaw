@@ -17,6 +17,8 @@ ARG OPENCLAW_NODE_BOOKWORM_DIGEST="sha256:b501c082306a4f528bc4038cbf2fbb58095d58
 ARG OPENCLAW_NODE_BOOKWORM_SLIM_IMAGE="node:22-bookworm-slim@sha256:9c2c405e3ff9b9afb2873232d24bb06367d649aa3e6259cbe314da59578e81e9"
 ARG OPENCLAW_NODE_BOOKWORM_SLIM_DIGEST="sha256:9c2c405e3ff9b9afb2873232d24bb06367d649aa3e6259cbe314da59578e81e9"
 
+FROM golang:1.25-bookworm AS go-runtime
+
 # Base images are pinned to SHA256 digests for reproducible builds.
 # Trade-off: digests must be updated manually when upstream tags move.
 # To update, run: docker manifest inspect node:22-bookworm (or podman)
@@ -124,6 +126,14 @@ COPY --from=build --chown=node:node /app/docs ./docs
 RUN corepack enable && \
     corepack prepare "$(node -p "require('./package.json').packageManager")" --activate
 
+# Use the official Go toolchain instead of Debian's older apt package so
+# Go-installed tools can consume modules that require Go 1.24.x.
+COPY --from=go-runtime /usr/local/go /usr/local/go
+ENV PATH="/usr/local/go/bin:/home/node/go/bin:${PATH}"
+ENV GOPATH="/home/node/go"
+ENV GOBIN="/home/node/go/bin"
+RUN mkdir -p /home/node/go/bin && chown -R node:node /home/node/go
+
 # Install additional system packages needed by your skills or extensions.
 # Example: docker build --build-arg OPENCLAW_DOCKER_APT_PACKAGES="python3 wget" .
 ARG OPENCLAW_DOCKER_APT_PACKAGES=""
@@ -146,6 +156,34 @@ RUN if [ -n "$OPENCLAW_INSTALL_BROWSER" ]; then \
       PLAYWRIGHT_BROWSERS_PATH=/home/node/.cache/ms-playwright \
       node /app/node_modules/playwright-core/cli.js install --with-deps chromium && \
       chown -R node:node /home/node/.cache/ms-playwright && \
+      apt-get clean && \
+      rm -rf /var/lib/apt/lists/* /var/cache/apt/archives/*; \
+    fi
+
+# Optionally install Homebrew (Linuxbrew) for build/runtime workflows that need
+# formulas unavailable via apt.
+# Build with: docker build --build-arg OPENCLAW_INSTALL_BREW=1 ...
+ARG OPENCLAW_INSTALL_BREW=""
+ARG OPENCLAW_BREW_INSTALL_DIR="/home/linuxbrew/.linuxbrew"
+ENV HOMEBREW_PREFIX="${OPENCLAW_BREW_INSTALL_DIR}"
+ENV HOMEBREW_CELLAR="${OPENCLAW_BREW_INSTALL_DIR}/Cellar"
+ENV HOMEBREW_REPOSITORY="${OPENCLAW_BREW_INSTALL_DIR}/Homebrew"
+ENV PATH="${OPENCLAW_BREW_INSTALL_DIR}/bin:${OPENCLAW_BREW_INSTALL_DIR}/sbin:${PATH}"
+RUN if [ -n "$OPENCLAW_INSTALL_BREW" ]; then \
+      apt-get update && \
+      DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+        build-essential ca-certificates curl file git procps sudo && \
+      if ! id -u linuxbrew >/dev/null 2>&1; then useradd -m -s /bin/bash linuxbrew; fi && \
+      mkdir -p "${OPENCLAW_BREW_INSTALL_DIR}" && \
+      chown -R linuxbrew:linuxbrew "$(dirname "${OPENCLAW_BREW_INSTALL_DIR}")" && \
+      su - linuxbrew -c "NONINTERACTIVE=1 CI=1 /bin/bash -c '$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)'" && \
+      if [ ! -e "${OPENCLAW_BREW_INSTALL_DIR}/Library" ]; then ln -s "${OPENCLAW_BREW_INSTALL_DIR}/Homebrew/Library" "${OPENCLAW_BREW_INSTALL_DIR}/Library"; fi && \
+      if [ ! -x "${OPENCLAW_BREW_INSTALL_DIR}/bin/brew" ]; then echo \"brew install failed\" >&2; exit 1; fi && \
+      # Use a wrapper script instead of a symlink so Homebrew resolves its
+      # prefix from the real binary path, not /usr/local (ARM-safe).
+      printf '#!/bin/sh\nexec "%s/bin/brew" "$@"\n' "${OPENCLAW_BREW_INSTALL_DIR}" \
+        > /usr/local/bin/brew && chmod 755 /usr/local/bin/brew && \
+      chown -R node:node "${OPENCLAW_BREW_INSTALL_DIR}" && \
       apt-get clean && \
       rm -rf /var/lib/apt/lists/* /var/cache/apt/archives/*; \
     fi
@@ -181,6 +219,19 @@ RUN if [ -n "$OPENCLAW_INSTALL_DOCKER_CLI" ]; then \
       apt-get clean && \
       rm -rf /var/lib/apt/lists/* /var/cache/apt/archives/*; \
     fi
+
+# Give the non-root runtime user a writable npm global directory so
+# later `npm install -g ...` commands do not need to write to /usr/local.
+RUN mkdir -p /home/node/.npm-global && chown -R node:node /home/node/.npm-global
+# Persist GOBIN/GOPATH in Go's own env file so `go install` always resolves
+# to a node-writable directory, even when shell env vars are not inherited
+# (e.g. docker exec without -e, su -, or subprocess env resets).
+RUN mkdir -p /home/node/.config/go \
+ && printf 'GOBIN=%s\nGOPATH=%s\n' "/home/node/go/bin" "/home/node/go" \
+      > /home/node/.config/go/env \
+ && chown -R node:node /home/node/.config
+ENV NPM_CONFIG_PREFIX=/home/node/.npm-global
+ENV PATH="/home/node/.npm-global/bin:${PATH}"
 
 # Normalize extension paths so plugin safety checks do not reject
 # world-writable directories inherited from source file modes.
